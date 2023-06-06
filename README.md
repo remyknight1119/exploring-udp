@@ -906,6 +906,38 @@ description: Based on Linux-4.14.316
  630 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
  631     nf_bridge_put(skb->nf_bridge);
  632 #endif
- 633 }c
+ 633 }
 ```
 
+* 625: skb->destructor指向的是sock\_wfree();
+
+```c
+1815  * Write buffer destructor automatically called from kfree_skb.
+1816  */     
+1817 void sock_wfree(struct sk_buff *skb)
+1818 {
+1819     struct sock *sk = skb->sk;
+1820     unsigned int len = skb->truesize;
+1821 
+1822     if (!sock_flag(sk, SOCK_USE_WRITE_QUEUE)) {
+1823         /*
+1824          * Keep a reference on sk_wmem_alloc, this will be released
+1825          * after sk_write_space() call
+1826          */
+1827         WARN_ON(refcount_sub_and_test(len - 1, &sk->sk_wmem_alloc));
+1828         sk->sk_write_space(sk); 
+1829         len = 1;
+1830     }
+1831     /*
+1832      * if sk_wmem_alloc reaches 0, we must finish what sk_free()
+1833      * could not do because of in-flight packets
+1834      */
+1835     if (refcount_sub_and_test(len, &sk->sk_wmem_alloc))
+1836         __sk_free(sk);
+1837 }
+```
+
+* 1828: sk->sk\_write\_space指向sock\_def\_write\_space(), 唤醒epoll通知user EPOLLOUT event;
+* 1835: 减小sk->sk\_wmem\_alloc计数，允许user发送更多数据；
+
+总结：UDP没有send buffer用于保存上次发生未成功的skb, 它会将每次sendto/sendmsg系统调用发送的数据全部发送给网卡；由于网卡发送数据会有一定的延迟，会使得UDP如果发送数据过快会使得缓存在网卡的skb的总内存量超出了sk->sk\_sndbuf的限制，从而导致EAGAIN event的出现。当软中断在网卡发送完数据清空缓存后，UDP socket就可以收到epoll的EPOLLOUT事件并继续发送数据。
