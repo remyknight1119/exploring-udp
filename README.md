@@ -517,3 +517,395 @@ description: Based on Linux-4.14.316
 
 &#x20;       如果sock\_alloc\_send\_pskb返回了EAGAIN, 只有相应的skb得到释放、send buffer有空间(即sk->sk\_wmem\_alloc减小)之后epoll才会返回EPOLLOUT。什么时候sk->sk\_wmem\_alloc才会减小呢？需要跟踪一下skb什么时候释放。
 
+```c
+870 int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)                                                                                                                                       
+871 {
+...
+1044 back_from_confirm:
+1045 
+1046     saddr = fl4->saddr;
+1047     if (!ipc.addr)
+1048         daddr = ipc.addr = fl4->daddr;
+1049 
+1050     /* Lockless fast path for the non-corking case. */
+1051     if (!corkreq) {
+1052         skb = ip_make_skb(sk, fl4, getfrag, msg, ulen,
+1053                   sizeof(struct udphdr), &ipc, &rt,
+1054                   msg->msg_flags);
+1055         err = PTR_ERR(skb);
+1056         if (!IS_ERR_OR_NULL(skb))
+1057             err = udp_send_skb(skb, fl4);
+1058         goto out;
+1059     }
+```
+
+&#x20;   udp\_sendmsg()在调用ip\_make\_skb()申请完毕skb之后，会调用udp\_send\_skb()将skb发送出去；udp\_send\_skb()最终会调到\_\_netdev\_start\_xmit()(<mark style="color:blue;">**udp\_send\_skb()-->ip\_send\_skb()-->ip\_local\_out()-->\_\_ip\_local\_out()-->dst\_output()-->ip\_output()-->ip\_finish\_output()-->ip\_finish\_output2()-->neigh\_output()-->dev\_queue\_xmit()-->\_\_dev\_queue\_xmit()-->\_\_dev\_xmit\_skb()-->sch\_direct\_xmit()-->dev\_hard\_start\_xmit()-->xmit\_one()-->netdev\_start\_xmit()-->\_\_netdev\_start\_xmit()**</mark>):
+
+```c
+4051 static inline netdev_tx_t __netdev_start_xmit(const struct net_device_ops *ops,
+4052                           struct sk_buff *skb, struct net_device *dev,                                                                                                               
+4053                           bool more)                                                                                                                                                 
+4054 {
+4055     skb->xmit_more = more ? 1 : 0; 
+4056     return ops->ndo_start_xmit(skb, dev);                                                                                                                                            
+4057 }
+```
+
+&#x20;   ops->ndo\_start\_xmit指向的是网卡driver的相应函数；以vmxnet3网卡为例，这个指针指向的就是vmxnet3\_xmit\_frame()：
+
+```c
+3235 static int
+3236 vmxnet3_probe_device(struct pci_dev *pdev,
+3237              const struct pci_device_id *id)
+3238 {                       
+3239     static const struct net_device_ops vmxnet3_netdev_ops = {
+3240         .ndo_open = vmxnet3_open,
+3241         .ndo_stop = vmxnet3_close,
+3242         .ndo_start_xmit = vmxnet3_xmit_frame,
+3243         .ndo_set_mac_address = vmxnet3_set_mac_addr,
+3244         .ndo_change_mtu = vmxnet3_change_mtu,
+3245         .ndo_set_features = vmxnet3_set_features,
+3246         .ndo_get_stats64 = vmxnet3_get_stats64,
+3247         .ndo_tx_timeout = vmxnet3_tx_timeout,
+3248         .ndo_set_rx_mode = vmxnet3_set_mc,
+3249         .ndo_vlan_rx_add_vid = vmxnet3_vlan_rx_add_vid,
+3250         .ndo_vlan_rx_kill_vid = vmxnet3_vlan_rx_kill_vid,
+3251 #ifdef CONFIG_NET_POLL_CONTROLLER
+3252         .ndo_poll_controller = vmxnet3_netpoll,
+3253 #endif           
+3254     };
+...
+```
+
+```c
+1152 static netdev_tx_t
+1153 vmxnet3_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
+1154 {
+1155     struct vmxnet3_adapter *adapter = netdev_priv(netdev);
+1156 
+1157     BUG_ON(skb->queue_mapping > adapter->num_tx_queues);
+1158     return vmxnet3_tq_xmit(skb,
+1159                    &adapter->tx_queue[skb->queue_mapping],
+1160                    adapter, netdev);
+1161 }
+1162 
+```
+
+```c
+ 968 /*
+ 969  * Transmits a pkt thru a given tq
+ 970  * Returns:
+ 971  *    NETDEV_TX_OK:      descriptors are setup successfully
+ 972  *    NETDEV_TX_OK:      error occurred, the pkt is dropped
+ 973  *    NETDEV_TX_BUSY:    tx ring is full, queue is stopped
+ 974  *
+ 975  * Side-effects:
+ 976  *    1. tx ring may be changed
+ 977  *    2. tq stats may be updated accordingly
+ 978  *    3. shared->txNumDeferred may be updated
+ 979  */
+ 980 
+ 981 static int
+ 982 vmxnet3_tq_xmit(struct sk_buff *skb, struct vmxnet3_tx_queue *tq,
+ 983         struct vmxnet3_adapter *adapter, struct net_device *netdev)
+ 984 {
+ 985     int ret;
+ 986     u32 count;
+ 987     unsigned long flags;
+ 988     struct vmxnet3_tx_ctx ctx;
+ 989     union Vmxnet3_GenericDesc *gdesc;
+ 990 #ifdef __BIG_ENDIAN_BITFIELD
+ 991     /* Use temporary descriptor to avoid touching bits multiple times */
+ 992     union Vmxnet3_GenericDesc tempTxDesc;
+ 993 #endif
+ ...
+1070     /* fill tx descs related to addr & len */
+1071     if (vmxnet3_map_pkt(skb, &ctx, tq, adapter->pdev, adapter))
+1072         goto unlock_drop_pkt;
+...
+```
+
+* 1070: vmxnet3\_map\_pkt()函数将skb map到网卡的内存区；
+
+```c
+ 676 static int
+ 677 vmxnet3_map_pkt(struct sk_buff *skb, struct vmxnet3_tx_ctx *ctx,
+ 678         struct vmxnet3_tx_queue *tq, struct pci_dev *pdev,
+ 679         struct vmxnet3_adapter *adapter)
+ 680 {
+ 681     u32 dw2, len;
+ 682     unsigned long buf_offset;
+ 683     int i;
+ 684     union Vmxnet3_GenericDesc *gdesc;
+ 685     struct vmxnet3_tx_buf_info *tbi = NULL;
+ 686 
+ 687     BUG_ON(ctx->copy_size > skb_headlen(skb));
+ 688 
+ 689     /* use the previous gen bit for the SOP desc */
+ 690     dw2 = (tq->tx_ring.gen ^ 0x1) << VMXNET3_TXD_GEN_SHIFT;
+ 691 
+ 692     ctx->sop_txd = tq->tx_ring.base + tq->tx_ring.next2fill;
+ 693     gdesc = ctx->sop_txd; /* both loops below can be skipped */
+ 694 
+ 695     /* no need to map the buffer if headers are copied */
+ 696     if (ctx->copy_size) {
+ 697         ctx->sop_txd->txd.addr = cpu_to_le64(tq->data_ring.basePA +
+ 698                     tq->tx_ring.next2fill *
+ 699                     tq->txdata_desc_size);
+ 700         ctx->sop_txd->dword[2] = cpu_to_le32(dw2 | ctx->copy_size);
+ 701         ctx->sop_txd->dword[3] = 0;
+ 702         
+ 703         tbi = tq->buf_info + tq->tx_ring.next2fill;
+ 704         tbi->map_type = VMXNET3_MAP_NONE;
+ 705         
+ 706         netdev_dbg(adapter->netdev,
+ 707             "txd[%u]: 0x%Lx 0x%x 0x%x\n",
+ 708             tq->tx_ring.next2fill,
+ 709             le64_to_cpu(ctx->sop_txd->txd.addr),
+ 710             ctx->sop_txd->dword[2], ctx->sop_txd->dword[3]);
+ 711         vmxnet3_cmd_ring_adv_next2fill(&tq->tx_ring);
+ 712         
+ 713         /* use the right gen for non-SOP desc */
+ 714         dw2 = tq->tx_ring.gen << VMXNET3_TXD_GEN_SHIFT;
+ 715     }
+ 716 
+ 717     /* linear part can use multiple tx desc if it's big */
+ 718     len = skb_headlen(skb) - ctx->copy_size;
+ 719     buf_offset = ctx->copy_size;
+ 720     while (len) {
+ 721         u32 buf_size;
+ 722 
+ 723         if (len < VMXNET3_MAX_TX_BUF_SIZE) {
+ 724             buf_size = len;
+ 725             dw2 |= len;
+ 726         } else {
+ 727             buf_size = VMXNET3_MAX_TX_BUF_SIZE;
+ 728             /* spec says that for TxDesc.len, 0 == 2^14 */
+ 729         }
+ 730 
+ 731         tbi = tq->buf_info + tq->tx_ring.next2fill;
+ 732         tbi->map_type = VMXNET3_MAP_SINGLE;
+ 733         tbi->dma_addr = dma_map_single(&adapter->pdev->dev,
+ 734                 skb->data + buf_offset, buf_size,
+ 735                 PCI_DMA_TODEVICE);
+ 736         if (dma_mapping_error(&adapter->pdev->dev, tbi->dma_addr))
+ 737             return -EFAULT;
+ 738 
+ 739         tbi->len = buf_size;
+ 740 
+ 741         gdesc = tq->tx_ring.base + tq->tx_ring.next2fill;
+ 742         BUG_ON(gdesc->txd.gen == tq->tx_ring.gen);
+ 743 
+ 744         gdesc->txd.addr = cpu_to_le64(tbi->dma_addr);
+ 745         gdesc->dword[2] = cpu_to_le32(dw2);
+ 746         gdesc->dword[3] = 0;
+ 747 
+ 748         netdev_dbg(adapter->netdev,
+ 749             "txd[%u]: 0x%Lx 0x%x 0x%x\n",
+ 750             tq->tx_ring.next2fill, le64_to_cpu(gdesc->txd.addr),
+ 751             le32_to_cpu(gdesc->dword[2]), gdesc->dword[3]);
+ 752         vmxnet3_cmd_ring_adv_next2fill(&tq->tx_ring);
+ 753         dw2 = tq->tx_ring.gen << VMXNET3_TXD_GEN_SHIFT;
+ 754 
+ 755         len -= buf_size;
+ 756         buf_offset += buf_size;
+ 757     }
+ 758 
+ 759     for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+ 760         const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[i];
+ 761         u32 buf_size;
+ 762 
+ 763         buf_offset = 0;
+ 764         len = skb_frag_size(frag);
+ 765         while (len) {
+ 766             tbi = tq->buf_info + tq->tx_ring.next2fill;
+ 767             if (len < VMXNET3_MAX_TX_BUF_SIZE) {
+ 768                 buf_size = len;
+ 769                 dw2 |= len;
+ 770             } else {
+ 771                 buf_size = VMXNET3_MAX_TX_BUF_SIZE;
+ 772                 /* spec says that for TxDesc.len, 0 == 2^14 */
+ 773             }
+ 774             tbi->map_type = VMXNET3_MAP_PAGE;
+ 775             tbi->dma_addr = skb_frag_dma_map(&adapter->pdev->dev, frag,
+ 776                              buf_offset, buf_size,
+ 777                              DMA_TO_DEVICE);
+ 778             if (dma_mapping_error(&adapter->pdev->dev, tbi->dma_addr))
+ 779                 return -EFAULT;
+ 780 
+ 781             tbi->len = buf_size;
+ 782 
+ 783             gdesc = tq->tx_ring.base + tq->tx_ring.next2fill;
+ 784             BUG_ON(gdesc->txd.gen == tq->tx_ring.gen);
+ 785 
+ 786             gdesc->txd.addr = cpu_to_le64(tbi->dma_addr);
+ 787             gdesc->dword[2] = cpu_to_le32(dw2);
+ 788             gdesc->dword[3] = 0;
+ 789 
+ 790             netdev_dbg(adapter->netdev,
+ 791                 "txd[%u]: 0x%llx %u %u\n",
+ 792                 tq->tx_ring.next2fill, le64_to_cpu(gdesc->txd.addr),
+ 793                 le32_to_cpu(gdesc->dword[2]), gdesc->dword[3]);
+ 794             vmxnet3_cmd_ring_adv_next2fill(&tq->tx_ring);
+ 795             dw2 = tq->tx_ring.gen << VMXNET3_TXD_GEN_SHIFT;
+ 796 
+ 797             len -= buf_size;
+ 798             buf_offset += buf_size;
+ 799         }
+ 800     }
+ 801 
+ 802     ctx->eop_txd = gdesc;
+ 803 
+ 804     /* set the last buf_info for the pkt */
+ 805     tbi->skb = skb;
+ 806     tbi->sop_idx = ctx->sop_txd - tq->tx_ring.base;
+ 807 
+ 808     return 0;
+ 809 }
+```
+
+* 805: skb被挂在了tbi->skb指针上，tbi来自struct vmxnet3\_tx\_queue的buf\_info ring;
+
+当skb的数据被网卡发送到网络中后，(可能是)软中断上下文会调用vmxnet3\_tq\_tx\_complete()函数来释放skb:
+
+```c
+ 363 static int
+ 364 vmxnet3_tq_tx_complete(struct vmxnet3_tx_queue *tq,
+ 365             struct vmxnet3_adapter *adapter)
+ 366 {
+ 367     int completed = 0;
+ 368     union Vmxnet3_GenericDesc *gdesc;
+ 369 
+ 370     gdesc = tq->comp_ring.base + tq->comp_ring.next2proc;
+ 371     while (VMXNET3_TCD_GET_GEN(&gdesc->tcd) == tq->comp_ring.gen) {
+ 372         /* Prevent any &gdesc->tcd field from being (speculatively)
+ 373          * read before (&gdesc->tcd)->gen is read.
+ 374          */
+ 375         dma_rmb();
+ 376 
+ 377         completed += vmxnet3_unmap_pkt(VMXNET3_TCD_GET_TXIDX(
+ 378                            &gdesc->tcd), tq, adapter->pdev,
+ 379                            adapter);
+ 380 
+ 381         vmxnet3_comp_ring_adv_next2proc(&tq->comp_ring);
+ 382         gdesc = tq->comp_ring.base + tq->comp_ring.next2proc;
+ 383     }
+ 384 
+ 385     if (completed) {
+ 386         spin_lock(&tq->tx_lock);
+ 387         if (unlikely(vmxnet3_tq_stopped(tq, adapter) &&
+ 388                  vmxnet3_cmd_ring_desc_avail(&tq->tx_ring) >
+ 389                  VMXNET3_WAKE_QUEUE_THRESHOLD(tq) &&
+ 390                  netif_carrier_ok(adapter->netdev))) {
+ 391             vmxnet3_tq_wake(tq, adapter);
+ 392         }
+ 393         spin_unlock(&tq->tx_lock);
+ 394     }
+ 395     return completed;
+ 396 }
+```
+
+* 377: vmxnet3\_unmap\_pkt()会free vmxnet3\_tx\_queue的buf\_info ring上的skb;
+
+```c
+ 329 vmxnet3_unmap_pkt(u32 eop_idx, struct vmxnet3_tx_queue *tq,
+ 330           struct pci_dev *pdev, struct vmxnet3_adapter *adapter)
+ 331 {
+ 332     struct sk_buff *skb;
+ 333     int entries = 0;
+ 334 
+ 335     /* no out of order completion */
+ 336     BUG_ON(tq->buf_info[eop_idx].sop_idx != tq->tx_ring.next2comp);
+ 337     BUG_ON(VMXNET3_TXDESC_GET_EOP(&(tq->tx_ring.base[eop_idx].txd)) != 1);
+ 338 
+ 339     skb = tq->buf_info[eop_idx].skb;
+ 340     BUG_ON(skb == NULL);
+ 341     tq->buf_info[eop_idx].skb = NULL;
+ 342 
+ 343     VMXNET3_INC_RING_IDX_ONLY(eop_idx, tq->tx_ring.size);
+ 344 
+ 345     while (tq->tx_ring.next2comp != eop_idx) {
+ 346         vmxnet3_unmap_tx_buf(tq->buf_info + tq->tx_ring.next2comp,
+ 347                      pdev);
+ 348 
+ 349         /* update next2comp w/o tx_lock. Since we are marking more,
+ 350          * instead of less, tx ring entries avail, the worst case is
+ 351          * that the tx routine incorrectly re-queues a pkt due to
+ 352          * insufficient tx ring entries.
+ 353          */
+ 354         vmxnet3_cmd_ring_adv_next2comp(&tq->tx_ring);
+ 355         entries++;
+ 356     }
+ 357 
+ 358     dev_kfree_skb_any(skb);
+ 359     return entries;
+ 360 }
+```
+
+* 358: dev\_kfree\_skb\_any()释放skb;
+
+```c
+3282 static inline void dev_kfree_skb_any(struct sk_buff *skb)
+3283 {
+3284     __dev_kfree_skb_any(skb, SKB_REASON_DROPPED);
+3285 } 
+```
+
+```c
+2526 void __dev_kfree_skb_any(struct sk_buff *skb, enum skb_free_reason reason)
+2527 {
+2528     if (in_irq() || irqs_disabled())
+2529         __dev_kfree_skb_irq(skb, reason);
+2530     else if (unlikely(reason == SKB_REASON_DROPPED))
+2531         kfree_skb(skb);
+2532     else
+2533         consume_skb(skb);
+2534 }
+```
+
+```c
+ 666 void kfree_skb(struct sk_buff *skb)
+ 667 {
+ 668     if (!skb_unref(skb))
+ 669         return;
+ 670 
+ 671     trace_kfree_skb(skb, __builtin_return_address(0));
+ 672     __kfree_skb(skb);
+ 673 }
+```
+
+```c
+ 652 void __kfree_skb(struct sk_buff *skb)
+ 653 {
+ 654     skb_release_all(skb);
+ 655     kfree_skbmem(skb);
+ 656 }
+```
+
+```c
+ 636 static void skb_release_all(struct sk_buff *skb)
+ 637 {
+ 638     skb_release_head_state(skb);
+ 639     if (likely(skb->head))
+ 640         skb_release_data(skb);
+ 641 }
+```
+
+```c
+ 619 void skb_release_head_state(struct sk_buff *skb)
+ 620 {
+ 621     skb_dst_drop(skb);
+ 622     secpath_reset(skb);
+ 623     if (skb->destructor) {
+ 624         WARN_ON(in_irq());
+ 625         skb->destructor(skb);
+ 626     }
+ 627 #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ 628     nf_conntrack_put(skb_nfct(skb));
+ 629 #endif
+ 630 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 631     nf_bridge_put(skb->nf_bridge);
+ 632 #endif
+ 633 }c
+```
+
