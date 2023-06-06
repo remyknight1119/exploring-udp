@@ -430,8 +430,6 @@ description: Based on Linux-4.14.316
 
 981-983: UDP一定会调用sock\_alloc\_send\_skb()申请skb;
 
-1095: copy的data长度需要记录到sk->sk\_wmem\_alloc中；
-
 ```c
 2067 /*
 2068  *  Generic send/receive buffer handlers
@@ -488,9 +486,34 @@ description: Based on Linux-4.14.316
 2119 }                       
 ```
 
-2089-2090: 如果当前socket已经申请的写内存数量小于限制，则正常申请skb; sk\_wmem\_alloc\_get()返回的是sk->sk\_wmem\_alloc，即socket已经copy到kernel但尚未发送成功的数据长度；
+2089-2090: 如果当前socket已经申请的写内存数量小于限制，则正常申请skb; sk\_wmem\_alloc\_get()返回的是sk->sk\_wmem\_alloc，即socket已经申请但尚未释放的skb的总内存大小；
 
 2092-2099：否则如果超出的等待时间(no-blocking则不会等待)，就返回EAGAIN;
 
-如果返回了EAGAIN, 只有相应的skb得到释放、send buffer有空间(即sk->sk\_wmem\_alloc减小)之后epoll才会返回EPOLLOUT。什么时候sk->sk\_wmem\_alloc才会减小呢？需要跟踪一下skb什么时候释放。
+2103-2104: 将申请成功的skb的大小计入sk->sk\_wmem\_alloc中：
+
+```c
+1941 void skb_set_owner_w(struct sk_buff *skb, struct sock *sk)                                                                                                                                             
+1942 {
+1943     skb_orphan(skb);     
+1944     skb->sk = sk;        
+1945 #ifdef CONFIG_INET       
+1946     if (unlikely(!sk_fullsock(sk))) {  
+1947         skb->destructor = sock_edemux; 
+1948         sock_hold(sk);   
+1949         return;          
+1950     }
+1951 #endif
+1952     skb->destructor = sock_wfree;  
+1953     skb_set_hash_from_sk(skb, sk); 
+1954     /*
+1955      * We used to take a refcount on sk, but following operation
+1956      * is enough to guarantee sk_free() wont free this sock until
+1957      * all in-flight packets are completed                                                                                                                                                             
+1958      */
+1959     refcount_add(skb->truesize, &sk->sk_wmem_alloc);                                                                                                                                                   
+1960 }
+```
+
+&#x20;       如果sock\_alloc\_send\_pskb返回了EAGAIN, 只有相应的skb得到释放、send buffer有空间(即sk->sk\_wmem\_alloc减小)之后epoll才会返回EPOLLOUT。什么时候sk->sk\_wmem\_alloc才会减小呢？需要跟踪一下skb什么时候释放。
 
