@@ -428,7 +428,7 @@ description: Based on Linux-4.14.316
 1101     return 0;
 ```
 
-981-983: UDP一定会调用sock\_alloc\_send\_skb()申请skb;
+* 981-983: UDP一定会调用sock\_alloc\_send\_skb()申请skb;
 
 ```c
 2067 /*
@@ -486,11 +486,9 @@ description: Based on Linux-4.14.316
 2119 }                       
 ```
 
-2089-2090: 如果当前socket已经申请的写内存数量小于限制，则正常申请skb; sk\_wmem\_alloc\_get()返回的是sk->sk\_wmem\_alloc，即socket已经申请但尚未释放的skb的总内存大小；
-
-2092-2099：否则如果超出的等待时间(no-blocking则不会等待)，就返回EAGAIN;
-
-2103-2104: 将申请成功的skb的大小计入sk->sk\_wmem\_alloc中：
+* 2089-2090: 如果当前socket已经申请的写内存数量小于限制，则正常申请skb; sk\_wmem\_alloc\_get()返回的是sk->sk\_wmem\_alloc，即socket已经申请但尚未释放的skb的总内存大小；
+* 2092-2099：否则如果超出的等待时间(no-blocking则不会等待)，就返回EAGAIN;
+* 2103-2104: 将申请成功的skb的大小计入sk->sk\_wmem\_alloc中：
 
 ```c
 1941 void skb_set_owner_w(struct sk_buff *skb, struct sock *sk)                                                                                                                                             
